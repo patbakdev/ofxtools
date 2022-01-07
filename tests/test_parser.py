@@ -6,12 +6,19 @@ import unittest
 from unittest import TestCase
 from unittest.mock import MagicMock, call, patch, sentinel
 from xml.etree.ElementTree import Element
-from io import BytesIO, StringIO
+from io import BytesIO
 from tempfile import NamedTemporaryFile
+from collections import namedtuple
 
 
 # local imports
-from ofxtools.Parser import OFXTree, TreeBuilder, ParseError, main
+from ofxtools.Parser import OFXTree, TreeBuilder, ParseError
+
+
+# Container for results of TreeBuilderRegexTestCase._parsetag()
+TagParseResults = namedtuple(
+    "TagParseResults", ["tag", "cdata", "text", "closetag", "tail"]
+)
 
 
 class TreeBuilderRegexTestCase(TestCase):
@@ -32,42 +39,119 @@ class TreeBuilderRegexTestCase(TestCase):
         self.assertIsNotNone(m)
         groupdict = m.groupdict()
         self.assertEqual(len(groupdict), 5)
-        return (
-            groupdict["tag"],
-            groupdict["cdata"],
-            groupdict["text"],
-            groupdict["closetag"],
+        return TagParseResults(
+            tag=groupdict["tag"],
+            cdata=groupdict["cdata"],
+            text=groupdict["text"],
+            closetag=groupdict["closetag"],
+            tail=groupdict["tail"],
         )
 
     def test_sgml_tag(self):
         markup = "<TAG>data"
         parsed = self._parsetag(markup)
-        self.assertEqual(parsed, ("TAG", None, "data", None))
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertIsNone(parsed.cdata)
+        self.assertEqual(parsed.text, "data")
+        self.assertIsNone(parsed.closetag)
+        self.assertIsNone(parsed.tail)
 
     def test_sgml_endtag(self):
         markup = "</TAG>data"
         parsed = self._parsetag(markup)
-        self.assertEqual(parsed, ("/TAG", None, "data", None))
+        self.assertEqual(parsed.tag, "/TAG")
+        self.assertIsNone(parsed.cdata)
+        self.assertEqual(parsed.text, "data")
+        self.assertIsNone(parsed.closetag)
+        self.assertIsNone(parsed.tail)
 
     def test_xml_tag(self):
         markup = "<TAG>data</TAG>"
         parsed = self._parsetag(markup)
-        self.assertEqual(parsed, ("TAG", None, "data", "TAG"))
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertIsNone(parsed.cdata)
+        self.assertEqual(parsed.text, "data")
+        self.assertEqual(parsed.closetag, "TAG")
+        self.assertIsNone(parsed.tail)
 
     def test_xml_mismatched_endtag(self):
         markup = "<TAG>data</GAT>"
         parsed = self._parsetag(markup)
-        self.assertEqual(parsed, ("TAG", None, "data", None))
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertIsNone(parsed.cdata)
+        self.assertEqual(parsed.text, "data")
+        self.assertIsNone(parsed.closetag)
+        self.assertIsNone(parsed.tail)
 
     def test_xml_selfclosing_tag(self):
         markup = "<TAG />"
         parsed = self._parsetag(markup)
-        self.assertEqual(parsed, ("TAG /", None, None, None))
+        self.assertEqual(parsed.tag, "TAG /")
+        self.assertIsNone(parsed.cdata)
+        self.assertIsNone(parsed.text)
+        self.assertIsNone(parsed.closetag)
+        self.assertIsNone(parsed.tail)
 
     def test_cdata(self):
-        markup = "<TAG><![CDATA[data]]></TAG>"
+        markup = "<TAG><![CDATA[cdata]]>"
         parsed = self._parsetag(markup)
-        self.assertEqual(parsed, ("TAG", "data", None, "TAG"))
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertEqual(parsed.cdata, "cdata")
+        self.assertIsNone(parsed.text)
+        self.assertIsNone(parsed.closetag)
+        self.assertIsNone(parsed.tail)
+
+    def test_cdata_closing_tag(self):
+        markup = "<TAG><![CDATA[cdata]]></TAG>"
+        parsed = self._parsetag(markup)
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertEqual(parsed.cdata, "cdata")
+        self.assertIsNone(parsed.text)
+        self.assertEqual(parsed.closetag, "TAG")
+        self.assertIsNone(parsed.tail)
+
+    def test_cdata_spaces_after(self):
+        markup = "<TAG><![CDATA[cdata  ]]></TAG>"
+        parsed = self._parsetag(markup)
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertEqual(parsed.cdata, "cdata  ")
+        self.assertIsNone(parsed.text)
+        self.assertEqual(parsed.closetag, "TAG")
+        self.assertIsNone(parsed.tail)
+
+    def test_cdata_spaces_before(self):
+        markup = "<TAG><![CDATA[  cdata]]></TAG>"
+        parsed = self._parsetag(markup)
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertEqual(parsed.cdata, "  cdata")
+        self.assertIsNone(parsed.text)
+        self.assertEqual(parsed.closetag, "TAG")
+        self.assertIsNone(parsed.tail)
+
+    def test_cdata_html(self):
+        markup = (
+            "<TAG><![CDATA["
+            "<HTML><BODY>"
+            "I didn’t earn any interest this month. Can you please tell me "
+            "what I need to do to earn interest on this account?"
+            "</BODY></HTML>"
+            "]]></TAG>"
+        )
+        parsed = self._parsetag(markup)
+        self.assertEqual(parsed.tag, "TAG")
+        self.assertEqual(
+            parsed.cdata,
+            (
+                "<HTML><BODY>"
+                "I didn’t earn any interest this month. Can you please tell me "
+                "what I need to do to earn interest on this account?"
+                "</BODY></HTML>"
+            ),
+        )
+
+        self.assertIsNone(parsed.text)
+        self.assertEqual(parsed.closetag, "TAG")
+        self.assertIsNone(parsed.tail)
 
     def test_finditer_sgml(self):
         markup = "<TAG1><TAG2>value"
@@ -329,6 +413,76 @@ class TreeBuilderUnitFunctionalTestCase(TestCase):
             "</OFX>"
         )
         self._testFeedSonrs(body)
+
+    def testCdata(self):
+        """
+        TreeBuilder.feed() correctly parses element value incorporating CDATA
+        """
+        body = (
+            "<MAILTRNRS>"
+            "<TRNUID>54321"
+            "<STATUS>"
+            "<CODE>0"
+            "<SEVERITY>INFO"
+            "</STATUS>"
+            "<MAILRS>"
+            "<MAIL>"
+            "<USERID>123456789"
+            "<FROM>James Hackleman"
+            "<TO>Noelani Federal Savings"
+            "<SUBJECT>What do I need to earn interest?"
+            "<DTCREATED>19960305"
+            "<MSGBODY><![CDATA[<HTML><BODY>I didn’t earn any interest this "
+            "month. Can you please tell me what I need to do to earn interest on this "
+            "account?</BODY></HTML>"
+            "]]></MSGBODY>"
+            "<INCIMAGES>N"
+            "<USEHTML>Y"
+            "</MAIL>"
+            "</MAILRS>"
+            "</MAILTRNRS>"
+        )
+        builder = TreeBuilder()
+        builder.feed(body)
+        root = builder.close()
+
+        self._testElement(root, tag="MAILTRNRS", text=None, length=3)
+
+        trnuid = root[0]
+        self._testElement(trnuid, tag="TRNUID", text="54321", length=0)
+
+        status = root[1]
+        self._testElement(status, tag="STATUS", text=None, length=2)
+        code, severity = status
+        self._testElement(code, tag="CODE", text="0", length=0)
+        self._testElement(severity, tag="SEVERITY", text="INFO", length=0)
+
+        mailrs = root[2]
+        self._testElement(mailrs, tag="MAILRS", text=None, length=1)
+        mail = mailrs[0]
+        self._testElement(mail, tag="MAIL", text=None, length=8)
+
+        userid, from_, to, subject, dtcreated, msgbody, incimages, usehtml = mail
+        self._testElement(userid, tag="USERID", text="123456789", length=0)
+        self._testElement(from_, tag="FROM", text="James Hackleman", length=0)
+        self._testElement(to, tag="TO", text="Noelani Federal Savings", length=0)
+        self._testElement(
+            subject, tag="SUBJECT", text="What do I need to earn interest?", length=0
+        )
+        self._testElement(dtcreated, tag="DTCREATED", text="19960305", length=0)
+        self._testElement(
+            msgbody,
+            tag="MSGBODY",
+            text=(
+                "<HTML><BODY>"
+                "I didn’t earn any interest this month. Can you please tell me "
+                "what I need to do to earn interest on this account?"
+                "</BODY></HTML>"
+            ),
+            length=0,
+        )
+        self._testElement(incimages, tag="INCIMAGES", text="N", length=0)
+        self._testElement(usehtml, tag="USEHTML", text="Y", length=0)
 
 
 class OFXTreeTestCase(TestCase):
